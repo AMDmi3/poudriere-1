@@ -279,6 +279,7 @@ run_hook() {
 		POUDRIERED="${POUDRIERED}" \
 		POUDRIERE_DATA="${POUDRIERE_DATA}" \
 		MASTERNAME="${MASTERNAME}" \
+		MASTERMNT="${MASTERMNT}" \
 		BUILDNAME="${BUILDNAME}" \
 		JAILNAME="${JAILNAME}" \
 		PTNAME="${PTNAME}" \
@@ -322,7 +323,7 @@ log_start() {
 		[ "${USE_COLORS}" = "yes" ] && stripcolors_pipe="stripcolors |"
 		[ "${TIMESTAMP_LOGS}" = "yes" ] && add_ts_pipe="timestamp |"
 		eval ${add_ts_pipe} ${stripcolors_pipe} tee ${logfile}
-	} < ${logfile}.pipe >&3 &
+	} < ${logfile}.pipe &
 	tpid=$!
 	exec > ${logfile}.pipe 2>&1
 
@@ -986,6 +987,7 @@ EOF
 ./var/tmp/*
 ./wrkdirs/*
 EOF
+		(cd ${mnt} ;  find ./usr/local -type d )>> ${mnt}/.p/mtree.${name}exclude
 		;;
 	esac
 	mtree -X ${mnt}/.p/mtree.${name}exclude \
@@ -1029,7 +1031,7 @@ do_jail_mounts() {
 	fi
 
 	# Mount /usr/src into target, no need for anything to write to it
-	[ -d "${from}/usr/src" ] && \
+	[ -d "${from}/usr/src" -a "${from}" != "${mnt}" ] && \
 	    ${NULLMOUNT} -o ro ${from}/usr/src ${mnt}/usr/src
 
 	# ref jail only needs devfs
@@ -1040,7 +1042,9 @@ do_jail_mounts() {
 			devfs -m ${mnt}/dev/ rule apply path "${p}" unhide
 		done
 	fi
-	if [ "${mnt##*/}" != "ref" ]; then
+
+	# Only do this in cloned build jails. from==mnt is via jail -u
+	if [ "${mnt##*/}" != "ref" -a "${from}" != "${mnt}" ]; then
 		[ "${USE_FDESCFS}" = "yes" ] && \
 		    [ ${JAILED} -eq 0 -o "${PATCHED_FS_KERNEL}" = "yes" ] && \
 		    mount -t fdescfs fdesc ${mnt}/dev/fd
@@ -1076,10 +1080,9 @@ enter_interactive() {
 		ensure_pkg_installed force_extract
 		# Install the selected PKGNG package
 		injail env USE_PACKAGE_DEPENDS_ONLY=1 \
-		    PKG_ADD="/.p/pkg-static add" \
 		    make -C \
 		    /usr/ports/$(injail make -f /usr/ports/Mk/bsd.port.mk \
-		    -V PKGNG_ORIGIN) install-package
+		    -V PKGNG_ORIGIN) PKG_BIN="${PKG_BIN}" install-package
 	fi
 
 	# Enable all selected ports and their run-depends
@@ -1434,7 +1437,8 @@ jail_start() {
 	[ ${JAIL_OSVERSION} -lt 900000 ] && needkld="${needkld} sem"
 
 	[ -d ${DISTFILES_CACHE:-/nonexistent} ] || err 1 "DISTFILES_CACHE directory does not exist. (c.f. poudriere.conf)"
-	[ $(sysctl -n kern.securelevel) -lt 1 ] || err 1 "kern.securelevel >= 1. Poudriere requires no securelevel to be able to handle schg flags."
+	[ ${TMPFS_ALL} -ne 1 ] && [ $(sysctl -n kern.securelevel) -ge 1 ] && \
+	    err 1 "kern.securelevel >= 1. Poudriere requires no securelevel to be able to handle schg flags. USE_TMPFS=all can override this."
 
 	if [ -z "${NOLINUX}" ]; then
 		if [ "${arch}" = "i386" -o "${arch}" = "amd64" ]; then
@@ -1544,22 +1548,22 @@ jail_start() {
 	# jail -s should not do this or jail will stop on EXIT
 	WITH_PKGNG=$(injail make -f /usr/ports/Mk/bsd.port.mk -V WITH_PKGNG)
 	if [ -n "${WITH_PKGNG}" ]; then
-		export PKGNG=1
-		export PKG_EXT="txz"
-		export PKG_BIN="${LOCALBASE:-/usr/local}/sbin/pkg-static"
-		export PKG_ADD="${PKG_BIN} add"
-		export PKG_DELETE="${PKG_BIN} delete -y -f"
-		export PKG_VERSION="/.p/pkg-static version"
+		PKGNG=1
+		PKG_EXT="txz"
+		PKG_BIN="/.p/pkg-static"
+		PKG_ADD="${PKG_BIN} add"
+		PKG_DELETE="${PKG_BIN} delete -y -f"
+		PKG_VERSION="${PKG_BIN} version"
 
 		[ -n "${PKG_REPO_SIGNING_KEY}" ] &&
 			! [ -f "${PKG_REPO_SIGNING_KEY}" ] &&
 			err 1 "PKG_REPO_SIGNING_KEY defined but the file is missing."
 	else
-		export PKGNG=0
-		export PKG_ADD=pkg_add
-		export PKG_DELETE=pkg_delete
-		export PKG_VERSION=pkg_version
-		export PKG_EXT="tbz"
+		PKGNG=0
+		PKG_ADD=pkg_add
+		PKG_DELETE=pkg_delete
+		PKG_VERSION=pkg_version
+		PKG_EXT="tbz"
 	fi
 
 	# 8.3 did not have distrib-dirs ran on it, so various
@@ -1568,6 +1572,10 @@ jail_start() {
 		injail mtree -eu -f /etc/mtree/BSD.var.dist -p /var >/dev/null 2>&1 || :
 		injail mtree -eu -f /etc/mtree/BSD.usr.dist -p /usr >/dev/null 2>&1 || :
 	fi
+
+	run_hook jail start
+
+	return 0
 }
 
 load_blacklist() {
@@ -2020,8 +2028,9 @@ _real_build_port() {
 				msg "Checking shared library dependencies"
 				listfilecmd="grep -v '^@' /var/db/pkg/${PKGNAME}/+CONTENTS"
 				[ ${PKGNG} -eq 1 ] && listfilecmd="pkg query '%Fp' ${PKGNAME}"
-				injail ${listfilecmd} | injail xargs ldd 2>&1 |
-					awk '/=>/ { print $3 }' | sort -u
+				injail ${listfilecmd} | \
+				    injail xargs readelf -d 2>/dev/null | \
+				    grep NEEDED | sort -u
 			fi
 			;;
 		esac
@@ -2420,6 +2429,8 @@ ${dependency_cycles}"
 		_log_path log
 		for pkgname in ${dead_packages}; do
 			cache_get_origin origin "${pkgname}"
+			# Symlink the buildlog into errors/
+			ln -s "../${pkgname}.log" "${log}/logs/errors/${pkgname}.log"
 			badd ports.failed "${origin} ${pkgname} ${failed_phase} ${failed_phase}"
 			COLOR_ARROW="${COLOR_FAIL}" job_msg \
 			    "${COLOR_FAIL}Finished build of ${COLOR_PORT}${origin}${COLOR_FAIL}: Failed: ${COLOR_PHASE}${failed_phase}"
@@ -2899,7 +2910,7 @@ deps_file() {
 		if [ "${PKG_EXT}" = "tbz" ]; then
 			injail tar -qxf "/packages/All/${pkg##*/}" -O +CONTENTS | awk '$1 == "@pkgdep" { print $2 }' > "${_depfile}"
 		else
-			injail /.p/pkg-static info -qdF "/packages/All/${pkg##*/}" > "${_depfile}"
+			injail ${PKG_BIN} info -qdF "/packages/All/${pkg##*/}" > "${_depfile}"
 		fi
 	fi
 
@@ -2924,7 +2935,7 @@ pkg_get_origin() {
 				_origin=$(injail tar -qxf "/packages/All/${pkg##*/}" -O +CONTENTS | \
 					awk -F: '$1 == "@comment ORIGIN" { print $2 }')
 			else
-				_origin=$(injail /.p/pkg-static query -F \
+				_origin=$(injail ${PKG_BIN} query -F \
 					"/packages/All/${pkg##*/}" "%o")
 			fi
 		fi
@@ -2955,7 +2966,7 @@ pkg_get_dep_origin() {
 			compiled_dep_origins=$(injail tar -qxf "/packages/All/${pkg##*/}" -O +CONTENTS | \
 				awk -F: '$1 == "@comment DEPORIGIN" {print $2}' | tr '\n' ' ')
 		else
-			compiled_dep_origins=$(injail /.p/pkg-static query -F \
+			compiled_dep_origins=$(injail ${PKG_BIN} query -F \
 				"/packages/All/${pkg##*/}" '%do' | tr '\n' ' ')
 		fi
 		echo "${compiled_dep_origins}" > "${dep_origin_file}"
@@ -2996,7 +3007,7 @@ pkg_get_options() {
 				awk -F: '$1 == "@comment OPTIONS" {print $2}' | tr ' ' '\n' | \
 				sed -n 's/^\+\(.*\)/\1/p' | sort | tr '\n' ' ')
 		else
-			_compiled_options=$(injail /.p/pkg-static query -F \
+			_compiled_options=$(injail ${PKG_BIN} query -F \
 				"/packages/All/${pkg##*/}" '%Ov%Ok' | sed '/^off/d;/^false/d;s/^on//;s/^true//' | sort | tr '\n' ' ')
 		fi
 		echo "${_compiled_options}" > "${optionsfile}"
@@ -3595,6 +3606,7 @@ delete_stale_symlinks_and_empty_dirs() {
 }
 
 load_moved() {
+	[ -f ${MASTERMNT}/usr/ports/MOVED ] || return 0
 	msg "Loading MOVED"
 	bset status "loading_moved:"
 	mkdir ${MASTERMNT}/.p/MOVED
@@ -3984,7 +3996,8 @@ clean_restricted() {
 	# mount_nullfs does not support mount -u
 	umount -f ${MASTERMNT}/packages
 	mount_packages
-	injail make -C /usr/ports -j ${PARALLEL_JOBS} clean-restricted >/dev/null
+	injail make -s -C /usr/ports -j ${PARALLEL_JOBS} \
+	    RM="/bin/rm -fv" ECHO_MSG="true" clean-restricted
 	# For pkg_install remove packages that have lost one of their dependency
 	if [ ${PKGNG} -eq 0 ]; then
 		msg_verbose "Checking packages for missing dependencies"
@@ -4024,7 +4037,7 @@ build_repo() {
 		if [ -n "${PKG_REPO_SIGNING_KEY}" ]; then
 			install -m 0400 ${PKG_REPO_SIGNING_KEY} \
 				${MASTERMNT}/tmp/repo.key
-			injail /.p/pkg-static repo -o /tmp/packages \
+			injail ${PKG_BIN} repo -o /tmp/packages \
 				${PKG_META} \
 				/packages /tmp/repo.key
 			rm -f ${MASTERMNT}/tmp/repo.key
@@ -4032,12 +4045,12 @@ build_repo() {
 			# Sometimes building repo from host is needed if
 			# using SSH with DNSSEC as older hosts don't support
 			# it.
-			${MASTERMNT}/.p/pkg-static repo \
+			${MASTERMNT}${PKG_BIN} repo \
 			    -o ${MASTERMNT}/tmp/packages ${PKG_META_MASTERMNT} \
 			    ${MASTERMNT}/packages \
 			    ${SIGNING_COMMAND:+signing_command: ${SIGNING_COMMAND}}
 		else
-			JNETNAME="n" injail /.p/pkg-static repo \
+			JNETNAME="n" injail ${PKG_BIN} repo \
 			    -o /tmp/packages ${PKG_META} /packages \
 			    ${SIGNING_COMMAND:+signing_command: ${SIGNING_COMMAND}}
 		fi

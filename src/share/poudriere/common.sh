@@ -215,8 +215,11 @@ injail() {
 	local name
 
 	_my_name name
-	jexec -U ${JUSER:-root} ${name}${JNETNAME:+-${JNETNAME}} \
-	    ${MAX_MEMORY_JEXEC} "$@"
+	rexec -s ${MASTERMNT}/.p/${name}${JNETNAME:+-${JNETNAME}}.sock \
+		-u ${JUSER:-root} ${MAX_MEMORY_JEXEC} $@
+
+#	jexec -U ${JUSER:-root} ${name}${JNETNAME:+-${JNETNAME}} \
+#	    ${MAX_MEMORY_JEXEC} "$@"
 }
 
 jstart() {
@@ -232,11 +235,15 @@ jstart() {
 		host.hostname=${BUILDER_HOSTNAME-${name}} \
 		${network} \
 		allow.socket_af allow.raw_sockets allow.chflags allow.sysvipc
+	mkdir -p ${MASTERMNT}/.p/
+	jexecd -j ${name} -d ${MASTERMNT}/.p/
 	jail -c persist name=${name}-n \
 		path=${MASTERMNT}${MY_JOBID+/../${MY_JOBID}} \
 		host.hostname=${BUILDER_HOSTNAME-${name}} \
 		${ipargs} \
 		allow.socket_af allow.raw_sockets allow.chflags allow.sysvipc
+	jexecd -j ${name}-n -d ${MASTERMNT}/.p/
+	injail id ${PORTBUILD_USER} ; echo $?
 	if ! injail id ${PORTBUILD_USER} >/dev/null 2>&1 ; then
 		msg_n "Creating user/group ${PORTBUILD_USER}"
 		injail pw groupadd ${PORTBUILD_USER} -g 65532 || \
@@ -3200,7 +3207,7 @@ delete_old_pkg() {
 				dpath=${d#*:/usr/ports/}
 				case ${td} in
 				LIB)
-					[ -n "${liblist}" ] || liblist=$(injail ldconfig -r | awk '$1 ~ /:-l/ { gsub(/.*-l/, "", $1); printf("%s ",$1) } END { printf("\n") }')
+					[ -n "${liblist}" ] || liblist=$(injail ldconfig -r | awk '$1 ~ /:-l/ { gsub(/.*-l/, "", $2); printf("%s ",$1) } END { printf("\n") }')
 					case ${key} in
 					lib*)
 						unset found
